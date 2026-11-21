@@ -1,0 +1,9 @@
+[package]
+name = "nova-semantic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nova-lexer = { path = "../nova-lexer" }
+nova-parser = { path = "../nova-parser" }

@@ -1,0 +1,47 @@
+use nova.ai
+use nova.nn
+
+fn main() {
+    print("=== Nova AI Engine: Tensors, Autograd & Training ===")
+
+    // 1. CPU Tensor Operations (matmul, transpose, broadcasting, reductions)
+    let x_mat = tensor([[1.0, 2.0], [3.0, 4.0]])
+    let bias = tensor([[0.5, -0.5]])
+    let shifted = x_mat + bias
+    print("Broadcast X + bias = " + str(shifted))
+    print("Transpose(X) = " + str(x_mat.transpose()))
+    print("dot([1,2,3], [4,5,6]) = " + str(dot(tensor([1.0, 2.0, 3.0]), tensor([4.0, 5.0, 6.0]))))
+    print("argmax(X) = " + str(x_mat.argmax()))
+
+    // 2. Composable Reverse-Mode Tensor Autograd
+    let vx = grad_var(tensor([[1.0, -2.0]]))
+    let vw = grad_var(tensor([[0.5, -1.0], [1.5, 0.5]]))
+    let vb = grad_var(tensor([[0.25, -0.25]]))
+    let target = tensor([[1.0, 0.0]])
+
+    let pred = grad_tanh(grad_add(grad_matmul(vx, vw), vb))
+    let loss = grad_mse(pred, target)
+    backward(loss)
+
+    print("Autograd forward pred = " + str(value_of(pred)))
+    print("Autograd MSE loss = " + str(value_of(loss)))
+    print("dL/dW = " + str(grad_of(vw)))
+    print("dL/db = " + str(grad_of(vb)))
+
+    // 3. Sequential Neural Network + Adam Optimizer on XOR
+    let xor_x = tensor([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]])
+    let xor_y = tensor([[0.0], [1.0], [1.0], [0.0]])
+
+    let model = model_new()
+    model_add_linear(model, 2, 4, 42)
+    model_add_activation(model, "tanh")
+    model_add_linear(model, 4, 1, 137)
+    model_add_activation(model, "sigmoid")
+
+    print("Model: " + str(model) + " (params=" + str(model_param_count(model)) + ")")
+
+    let opt = optimizer_adam(0.05)
+    let report = train_model(model, opt, xor_x, xor_y, 350, "mse")
+    print("Adam XOR report = " + str(report))
+    print("Trained forward(xor_x) = " + str(model_forward(model, xor_x)))
+}

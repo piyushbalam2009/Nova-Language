@@ -1,0 +1,7 @@
+use nova.nn
+
+fn main() {
+    print("Training 2-layer Dense neural network on XOR dataset...")
+    let report = train_xor(800, 0.8)
+    print("Training report: " + str(report))
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Nova Programming Language",
+  "description": "Compiler, intermediate representation, bytecode virtual machine, native C/GCC backend, tensor AI engine, and Rust workspace for the Nova programming language.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

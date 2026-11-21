@@ -1,0 +1,18 @@
+use nova.ai
+
+fn main() {
+    let a = tensor([[1.0, 2.0], [3.0, 4.0]])
+    let b = tensor([[5.0, 6.0], [7.0, 8.0]])
+
+    let product = a @ b
+    let activated = relu(product - 30.0)
+    let probs = softmax(tensor([2.0, 1.0, 0.1]))
+
+    print("A @ B = " + str(product))
+    print("Shape: " + str(product.shape()))
+    print("ReLU(A @ B - 30) = " + str(activated))
+    print("Softmax([2.0, 1.0, 0.1]) = " + str(probs))
+
+    let grads = autograd_demo(3.0, 2.0)
+    print("Autograd y=relu(x*w+1.5) at x=3,w=2: " + str(grads))
+}

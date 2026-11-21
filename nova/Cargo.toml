@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nova-lexer",
+    "crates/nova-parser",
+    "crates/nova-semantic",
+    "crates/nova-ir",
+    "crates/nova-bytecode",
+    "crates/nova-llvm",
+    "crates/nova-runtime",
+    "crates/nova-interpreter",
+    "crates/nova-vm",
+    "crates/nova-ai",
+    "crates/nova-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Nova Language Contributors"]
+description = "The Nova Programming Language compiler, virtual machine, runtime, and AI engine."

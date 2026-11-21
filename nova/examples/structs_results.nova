@@ -1,0 +1,29 @@
+struct User {
+    name: String
+    age: Int
+}
+
+fn divide(a: Float, b: Float) -> Result<Float, String> {
+    if b == 0.0 {
+        return Error("Division by zero")
+    }
+    return Ok(a / b)
+}
+
+fn main() {
+    let user = User {
+        name: "Alex",
+        age: 22
+    }
+    print("User: " + user.name + ", age " + str(user.age))
+
+    let ok_res = divide(42.0, 6.0)
+    let err_res = divide(10.0, 0.0)
+
+    print("divide(42.0, 6.0) -> " + str(ok_res))
+    print("divide(10.0, 0.0) -> " + str(err_res))
+
+    if is_ok(ok_res) {
+        print("Unwrapped value: " + str(unwrap(ok_res)))
+    }
+}

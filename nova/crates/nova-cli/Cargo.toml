@@ -1,0 +1,19 @@
+[package]
+name = "nova-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nova"
+path = "src/main.rs"
+
+[dependencies]
+nova-lexer = { path = "../nova-lexer" }
+nova-parser = { path = "../nova-parser" }
+nova-semantic = { path = "../nova-semantic" }
+nova-ir = { path = "../nova-ir" }
+nova-bytecode = { path = "../nova-bytecode" }
+nova-llvm = { path = "../nova-llvm" }
+nova-interpreter = { path = "../nova-interpreter" }
+nova-vm = { path = "../nova-vm" }

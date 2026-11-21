@@ -1,0 +1,14 @@
+[package]
+name = "nova-llvm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nova IR to LLVM 17+ opaque-pointer IR lowering, structural verifier, and native build/link driver."
+
+[dependencies]
+nova-ir = { path = "../nova-ir" }
+
+[dev-dependencies]
+nova-lexer = { path = "../nova-lexer" }
+nova-parser = { path = "../nova-parser" }
+nova-interpreter = { path = "../nova-interpreter" }

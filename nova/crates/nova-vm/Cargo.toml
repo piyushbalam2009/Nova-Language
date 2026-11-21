@@ -1,0 +1,15 @@
+[package]
+name = "nova-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nova-bytecode = { path = "../nova-bytecode" }
+nova-ir = { path = "../nova-ir" }
+nova-runtime = { path = "../nova-runtime" }
+
+[dev-dependencies]
+nova-interpreter = { path = "../nova-interpreter" }
+nova-lexer = { path = "../nova-lexer" }
+nova-parser = { path = "../nova-parser" }

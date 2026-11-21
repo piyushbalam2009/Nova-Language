@@ -1,0 +1,23 @@
+const MAX_DEPTH = 10
+
+fn add(a: Int, b: Int) -> Int {
+    return a + b
+}
+
+fn fib(n: Int) -> Int {
+    if n <= 1 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn main() {
+    let sum = add(10, 20)
+    print("add(10, 20) = " + str(sum))
+
+    mut total = 0
+    for i in 0..MAX_DEPTH {
+        total += fib(i)
+    }
+    print("Sum of first 10 Fibonacci numbers: " + str(total))
+}
