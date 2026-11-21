@@ -10,6 +10,7 @@
 //! Zero external dependencies; decoupled from ordinary Nova programs so non-AI workloads stay lightweight.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fmt;
 use std::rc::Rc;
 
@@ -638,14 +639,13 @@ impl Var {
     /// Reverse-mode topological backpropagation from this variable.
     pub fn backward(&self) -> Result<(), String> {
         let mut topo: Vec<Var> = Vec::new();
-        let mut visited: Vec<usize> = Vec::new();
+        let mut visited: HashSet<usize> = HashSet::new();
 
-        fn build(node: &Var, visited: &mut Vec<usize>, topo: &mut Vec<Var>) {
+        fn build(node: &Var, visited: &mut HashSet<usize>, topo: &mut Vec<Var>) {
             let id = node.ptr_id();
-            if visited.contains(&id) {
+            if !visited.insert(id) {
                 return;
             }
-            visited.push(id);
             let op = node.0.borrow().op.clone();
             match op {
                 GradOp::Leaf => {}

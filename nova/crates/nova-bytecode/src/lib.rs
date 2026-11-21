@@ -1,4 +1,4 @@
-//! Nova Bytecode Compiler, Instruction Set, and Static CFG/Stack-Height Verifier.
+//! Nova Bytecode Compiler, Instruction Set, `.nvbc` Binary Codec, and Static CFG/Stack-Height Verifier.
 
 use nova_ir::{CmpOp, ConstVal, Inst, IrModule};
 use std::collections::HashMap;
@@ -13,11 +13,15 @@ pub enum Op {
     PushConst(usize),
     LoadLocal(usize),
     StoreLocal(usize),
+    LoadGlobal(String),
+    StoreGlobal(String),
     Add,
     Sub,
     Mul,
     Div,
     Mod,
+    MatMul,
+    Neg,
     Not,
     CmpEq,
     CmpNeq,
@@ -25,6 +29,7 @@ pub enum Op {
     CmpLte,
     CmpGt,
     CmpGte,
+    AllocArray(usize),
     Jump(usize),
     JumpIfFalse(usize),
     Call { name: String, argc: usize },
@@ -32,7 +37,7 @@ pub enum Op {
     Pop,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompiledFn {
     pub name: String,
     pub arity: usize,
@@ -40,7 +45,7 @@ pub struct CompiledFn {
     pub code: Vec<Op>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
     pub magic: [u8; 6],
     pub version: u16,
@@ -114,6 +119,16 @@ pub fn compile(module: &IrModule) -> Chunk {
                         code.push(Op::LoadLocal(src_s));
                         code.push(Op::StoreLocal(dst_s));
                     }
+                    Inst::LoadGlobal { dst, name } => {
+                        let dst_s = slot_of(dst);
+                        code.push(Op::LoadGlobal(name.clone()));
+                        code.push(Op::StoreLocal(dst_s));
+                    }
+                    Inst::StoreGlobal { name, src } => {
+                        let src_s = slot_of(src);
+                        code.push(Op::LoadLocal(src_s));
+                        code.push(Op::StoreGlobal(name.clone()));
+                    }
                     Inst::Add { dst, left, right } => {
                         let (l, r, d) = (slot_of(left), slot_of(right), slot_of(dst));
                         code.push(Op::LoadLocal(l));
@@ -149,6 +164,19 @@ pub fn compile(module: &IrModule) -> Chunk {
                         code.push(Op::Mod);
                         code.push(Op::StoreLocal(d));
                     }
+                    Inst::MatMul { dst, left, right } => {
+                        let (l, r, d) = (slot_of(left), slot_of(right), slot_of(dst));
+                        code.push(Op::LoadLocal(l));
+                        code.push(Op::LoadLocal(r));
+                        code.push(Op::MatMul);
+                        code.push(Op::StoreLocal(d));
+                    }
+                    Inst::Neg { dst, src } => {
+                        let (s, d) = (slot_of(src), slot_of(dst));
+                        code.push(Op::LoadLocal(s));
+                        code.push(Op::Neg);
+                        code.push(Op::StoreLocal(d));
+                    }
                     Inst::Not { dst, src } => {
                         let (s, d) = (slot_of(src), slot_of(dst));
                         code.push(Op::LoadLocal(s));
@@ -172,6 +200,15 @@ pub fn compile(module: &IrModule) -> Chunk {
                             CmpOp::Gt => Op::CmpGt,
                             CmpOp::GtEq => Op::CmpGte,
                         });
+                        code.push(Op::StoreLocal(d));
+                    }
+                    Inst::AllocArray { dst, elements } => {
+                        for el in elements {
+                            let s = slot_of(el);
+                            code.push(Op::LoadLocal(s));
+                        }
+                        let d = slot_of(dst);
+                        code.push(Op::AllocArray(elements.len()));
                         code.push(Op::StoreLocal(d));
                     }
                     Inst::Call { dst, callee, args } => {
@@ -240,20 +277,22 @@ pub fn compile(module: &IrModule) -> Chunk {
 
 fn stack_effect(op: &Op) -> (usize, usize) {
     match op {
-        Op::PushConst(_) | Op::LoadLocal(_) => (0, 1),
-        Op::StoreLocal(_) | Op::JumpIfFalse(_) | Op::Pop => (1, 0),
-        Op::Not => (1, 1),
+        Op::PushConst(_) | Op::LoadLocal(_) | Op::LoadGlobal(_) => (0, 1),
+        Op::StoreLocal(_) | Op::StoreGlobal(_) | Op::JumpIfFalse(_) | Op::Pop => (1, 0),
+        Op::Neg | Op::Not => (1, 1),
         Op::Add
         | Op::Sub
         | Op::Mul
         | Op::Div
         | Op::Mod
+        | Op::MatMul
         | Op::CmpEq
         | Op::CmpNeq
         | Op::CmpLt
         | Op::CmpLte
         | Op::CmpGt
         | Op::CmpGte => (2, 1),
+        Op::AllocArray(count) => (*count, 1),
         Op::Jump(_) => (0, 0),
         Op::Call { argc, .. } => (*argc, 1),
         Op::Return => (1, 0),
@@ -461,9 +500,266 @@ pub fn validate(chunk: &Chunk) -> Result<(), String> {
     })
 }
 
+fn write_str(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, String> {
+    if *pos + 4 > bytes.len() {
+        return Err("Unexpected EOF while decoding .nvbc u32".to_string());
+    }
+    let val = u32::from_le_bytes([bytes[*pos], bytes[*pos + 1], bytes[*pos + 2], bytes[*pos + 3]]);
+    *pos += 4;
+    Ok(val)
+}
+
+fn read_str(bytes: &[u8], pos: &mut usize) -> Result<String, String> {
+    let len = read_u32(bytes, pos)? as usize;
+    if *pos + len > bytes.len() {
+        return Err("Unexpected EOF while decoding .nvbc string".to_string());
+    }
+    let s = std::str::from_utf8(&bytes[*pos..*pos + len])
+        .map_err(|_| "Invalid UTF-8 string in .nvbc".to_string())?
+        .to_string();
+    *pos += len;
+    Ok(s)
+}
+
+/// Serialize a compiled Nova bytecode chunk into the binary `.nvbc` wire format.
+pub fn encode_chunk(chunk: &Chunk) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&chunk.magic);
+    out.extend_from_slice(&chunk.version.to_le_bytes());
+    out.extend_from_slice(&(chunk.constants.len() as u32).to_le_bytes());
+    for c in &chunk.constants {
+        match c {
+            ConstVal::None => out.push(0),
+            ConstVal::Int(i) => {
+                out.push(1);
+                out.extend_from_slice(&i.to_le_bytes());
+            }
+            ConstVal::Float(f) => {
+                out.push(2);
+                out.extend_from_slice(&f.to_bits().to_le_bytes());
+            }
+            ConstVal::Bool(b) => {
+                out.push(3);
+                out.push(u8::from(*b));
+            }
+            ConstVal::Char(ch) => {
+                out.push(4);
+                out.extend_from_slice(&(*ch as u32).to_le_bytes());
+            }
+            ConstVal::Str(s) => {
+                out.push(5);
+                write_str(&mut out, s);
+            }
+        }
+    }
+
+    out.extend_from_slice(&(chunk.functions.len() as u32).to_le_bytes());
+    for f in &chunk.functions {
+        write_str(&mut out, &f.name);
+        out.extend_from_slice(&(f.arity as u32).to_le_bytes());
+        out.extend_from_slice(&(f.local_count as u32).to_le_bytes());
+        out.extend_from_slice(&(f.code.len() as u32).to_le_bytes());
+        for op in &f.code {
+            match op {
+                Op::PushConst(idx) => {
+                    out.push(1);
+                    out.extend_from_slice(&(*idx as u32).to_le_bytes());
+                }
+                Op::LoadLocal(s) => {
+                    out.push(2);
+                    out.extend_from_slice(&(*s as u32).to_le_bytes());
+                }
+                Op::StoreLocal(s) => {
+                    out.push(3);
+                    out.extend_from_slice(&(*s as u32).to_le_bytes());
+                }
+                Op::LoadGlobal(name) => {
+                    out.push(4);
+                    write_str(&mut out, name);
+                }
+                Op::StoreGlobal(name) => {
+                    out.push(5);
+                    write_str(&mut out, name);
+                }
+                Op::Add => out.push(6),
+                Op::Sub => out.push(7),
+                Op::Mul => out.push(8),
+                Op::Div => out.push(9),
+                Op::Mod => out.push(10),
+                Op::MatMul => out.push(11),
+                Op::Neg => out.push(12),
+                Op::Not => out.push(13),
+                Op::CmpEq => out.push(14),
+                Op::CmpNeq => out.push(15),
+                Op::CmpLt => out.push(16),
+                Op::CmpLte => out.push(17),
+                Op::CmpGt => out.push(18),
+                Op::CmpGte => out.push(19),
+                Op::AllocArray(n) => {
+                    out.push(20);
+                    out.extend_from_slice(&(*n as u32).to_le_bytes());
+                }
+                Op::Jump(t) => {
+                    out.push(21);
+                    out.extend_from_slice(&(*t as u32).to_le_bytes());
+                }
+                Op::JumpIfFalse(t) => {
+                    out.push(22);
+                    out.extend_from_slice(&(*t as u32).to_le_bytes());
+                }
+                Op::Call { name, argc } => {
+                    out.push(23);
+                    write_str(&mut out, name);
+                    out.extend_from_slice(&(*argc as u32).to_le_bytes());
+                }
+                Op::Return => out.push(24),
+                Op::Pop => out.push(25),
+            }
+        }
+    }
+    out
+}
+
+/// Deserialize a binary `.nvbc` byte buffer back into a `Chunk`.
+pub fn decode_chunk(bytes: &[u8]) -> Result<Chunk, String> {
+    if bytes.len() < 8 {
+        return Err("Invalid .nvbc buffer: shorter than 8-byte header".to_string());
+    }
+    let mut magic = [0u8; 6];
+    magic.copy_from_slice(&bytes[0..6]);
+    if &magic != BYTECODE_MAGIC {
+        return Err("Invalid .nvbc magic header".to_string());
+    }
+    let version = u16::from_le_bytes([bytes[6], bytes[7]]);
+    if version != BYTECODE_VERSION {
+        return Err(format!("Unsupported .nvbc version {version}"));
+    }
+
+    let mut pos = 8usize;
+    let const_count = read_u32(bytes, &mut pos)? as usize;
+    let mut constants = Vec::with_capacity(const_count);
+    for _ in 0..const_count {
+        if pos >= bytes.len() {
+            return Err("Unexpected EOF decoding constant tag".to_string());
+        }
+        let tag = bytes[pos];
+        pos += 1;
+        let val = match tag {
+            0 => ConstVal::None,
+            1 => {
+                if pos + 8 > bytes.len() {
+                    return Err("Unexpected EOF decoding Int constant".to_string());
+                }
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&bytes[pos..pos + 8]);
+                pos += 8;
+                ConstVal::Int(i64::from_le_bytes(b))
+            }
+            2 => {
+                if pos + 8 > bytes.len() {
+                    return Err("Unexpected EOF decoding Float constant".to_string());
+                }
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&bytes[pos..pos + 8]);
+                pos += 8;
+                ConstVal::Float(f64::from_bits(u64::from_le_bytes(b)))
+            }
+            3 => {
+                if pos >= bytes.len() {
+                    return Err("Unexpected EOF decoding Bool constant".to_string());
+                }
+                let b = bytes[pos] != 0;
+                pos += 1;
+                ConstVal::Bool(b)
+            }
+            4 => {
+                let code = read_u32(bytes, &mut pos)?;
+                let ch = char::from_u32(code)
+                    .ok_or_else(|| format!("Invalid Unicode scalar {code} in .nvbc"))?;
+                ConstVal::Char(ch)
+            }
+            5 => ConstVal::Str(read_str(bytes, &mut pos)?),
+            other => return Err(format!("Unknown constant tag {other} in .nvbc")),
+        };
+        constants.push(val);
+    }
+
+    let fn_count = read_u32(bytes, &mut pos)? as usize;
+    let mut functions = Vec::with_capacity(fn_count);
+    for _ in 0..fn_count {
+        let name = read_str(bytes, &mut pos)?;
+        let arity = read_u32(bytes, &mut pos)? as usize;
+        let local_count = read_u32(bytes, &mut pos)? as usize;
+        let code_len = read_u32(bytes, &mut pos)? as usize;
+        let mut code = Vec::with_capacity(code_len);
+        for _ in 0..code_len {
+            if pos >= bytes.len() {
+                return Err("Unexpected EOF decoding opcode".to_string());
+            }
+            let tag = bytes[pos];
+            pos += 1;
+            let op = match tag {
+                1 => Op::PushConst(read_u32(bytes, &mut pos)? as usize),
+                2 => Op::LoadLocal(read_u32(bytes, &mut pos)? as usize),
+                3 => Op::StoreLocal(read_u32(bytes, &mut pos)? as usize),
+                4 => Op::LoadGlobal(read_str(bytes, &mut pos)?),
+                5 => Op::StoreGlobal(read_str(bytes, &mut pos)?),
+                6 => Op::Add,
+                7 => Op::Sub,
+                8 => Op::Mul,
+                9 => Op::Div,
+                10 => Op::Mod,
+                11 => Op::MatMul,
+                12 => Op::Neg,
+                13 => Op::Not,
+                14 => Op::CmpEq,
+                15 => Op::CmpNeq,
+                16 => Op::CmpLt,
+                17 => Op::CmpLte,
+                18 => Op::CmpGt,
+                19 => Op::CmpGte,
+                20 => Op::AllocArray(read_u32(bytes, &mut pos)? as usize),
+                21 => Op::Jump(read_u32(bytes, &mut pos)? as usize),
+                22 => Op::JumpIfFalse(read_u32(bytes, &mut pos)? as usize),
+                23 => {
+                    let cname = read_str(bytes, &mut pos)?;
+                    let argc = read_u32(bytes, &mut pos)? as usize;
+                    Op::Call { name: cname, argc }
+                }
+                24 => Op::Return,
+                25 => Op::Pop,
+                other => return Err(format!("Unknown opcode tag {other} in .nvbc")),
+            };
+            code.push(op);
+        }
+        functions.push(CompiledFn {
+            name,
+            arity,
+            local_count,
+            code,
+        });
+    }
+
+    Ok(Chunk {
+        magic,
+        version,
+        constants,
+        functions,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nova_ir::lower_program;
+    use nova_lexer::tokenize;
+    use nova_parser::Parser;
 
     #[test]
     fn rejects_stack_underflow_and_missing_return() {
@@ -502,5 +798,20 @@ mod tests {
         };
         let errs = verify(&bad).unwrap_err();
         assert!(errs.iter().any(|e| e.code == "E0412" || e.code == "E0410"));
+    }
+
+    #[test]
+    fn round_trips_binary_nvbc_wire_format() {
+        let src = "const BASE = 10\nfn main() {\n    let arr = [1, 2, BASE]\n    print(arr)\n}";
+        let toks = tokenize(src).unwrap();
+        let prog = Parser::new(&toks).parse_program().unwrap();
+        let ir = lower_program(&prog);
+        let chunk = compile(&ir);
+        assert!(verify(&chunk).is_ok());
+
+        let encoded = encode_chunk(&chunk);
+        let decoded = decode_chunk(&encoded).unwrap();
+        assert_eq!(chunk, decoded);
+        assert!(verify(&decoded).is_ok());
     }
 }

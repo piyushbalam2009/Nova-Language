@@ -47,9 +47,25 @@ export interface NativeBuildResult {
   linkMs?: number;
 }
 
+const SANDBOX_ENV: NodeJS.ProcessEnv = {
+  PATH: '/usr/local/bin:/usr/bin:/bin',
+  LC_ALL: 'C',
+};
+
+const MAX_CHILD_OUTPUT_BYTES = 1024 * 1024;
+
+export function sanitizeModuleName(raw?: string): string {
+  if (!raw) return 'nova_program';
+  const cleaned = path
+    .basename(raw)
+    .replace(/[^a-zA-Z0-9_.-]/g, '_')
+    .slice(0, 64);
+  return cleaned.length > 0 && cleaned !== '.' && cleaned !== '..' ? cleaned : 'nova_program';
+}
+
 function hasCommand(bin: string): boolean {
   try {
-    execFileSync(bin, ['--version'], { stdio: 'ignore', timeout: 2000 });
+    execFileSync(bin, ['--version'], { stdio: 'ignore', timeout: 2000, env: SANDBOX_ENV });
     return true;
   } catch {
     return false;
@@ -84,7 +100,7 @@ export function buildNativeExecutable(
 
   const llvmRes = lowerToLLVMIR(ir, {
     targetTriple: toolchain.targetTriple,
-    moduleName: options.moduleName ?? 'nova_program',
+    moduleName: sanitizeModuleName(options.moduleName),
   });
   if (!llvmRes.supported || !llvmRes.llvmIR) {
     return {
@@ -193,17 +209,23 @@ export function buildNativeExecutable(
     execFileSync(cc, ['-std=c99', ...optFlags, '-I', tmpDir, '-c', runtimeCPath, '-o', runtimeObjPath], {
       timeout: 15000,
       encoding: 'utf8',
+      env: SANDBOX_ENV,
+      maxBuffer: MAX_CHILD_OUTPUT_BYTES,
     });
 
     if (backendUsed === 'llvm-clang') {
       execFileSync('clang', [...optFlags, '-Wno-override-module', '-c', programLLPath, '-o', programObjPath], {
         timeout: 15000,
         encoding: 'utf8',
+        env: SANDBOX_ENV,
+        maxBuffer: MAX_CHILD_OUTPUT_BYTES,
       });
     } else {
       execFileSync('gcc', ['-std=c99', ...optFlags, '-I', tmpDir, '-c', programCPath, '-o', programObjPath], {
         timeout: 15000,
         encoding: 'utf8',
+        env: SANDBOX_ENV,
+        maxBuffer: MAX_CHILD_OUTPUT_BYTES,
       });
     }
     const compileMs = Number((performance.now() - compileStart).toFixed(2));
@@ -217,12 +239,17 @@ export function buildNativeExecutable(
     execFileSync(cc, [programObjPath, runtimeObjPath, ...linkFlags, '-lm', '-o', outBinary], {
       timeout: 15000,
       encoding: 'utf8',
+      env: SANDBOX_ENV,
+      maxBuffer: MAX_CHILD_OUTPUT_BYTES,
     });
 
     const preStripBytes = fs.statSync(outBinary).size;
     let stripped = false;
     if (profile === 'release' && toolchain.strip) {
-      execFileSync('strip', ['--strip-all', outBinary], { timeout: 5000 });
+      execFileSync('strip', ['--strip-all', outBinary], {
+        timeout: 5000,
+        env: SANDBOX_ENV,
+      });
       stripped = true;
     }
     const linkMs = Number((performance.now() - linkStart).toFixed(2));
@@ -272,7 +299,12 @@ export function executeNativeBinary(
 ): { exitCode: number; stdout: string[]; stderr: string; execMs: number } {
   const start = performance.now();
   try {
-    const rawOut = execFileSync(binaryPath, [], { timeout: timeoutMs, encoding: 'utf8' });
+    const rawOut = execFileSync(binaryPath, [], {
+      timeout: timeoutMs,
+      encoding: 'utf8',
+      env: SANDBOX_ENV,
+      maxBuffer: MAX_CHILD_OUTPUT_BYTES,
+    });
     const execMs = Number((performance.now() - start).toFixed(2));
     const stdout = rawOut.length === 0 ? [] : rawOut.replace(/\n$/, '').split('\n');
     return { exitCode: 0, stdout, stderr: '', execMs };

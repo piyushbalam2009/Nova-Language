@@ -67,8 +67,16 @@ pub enum Stmt {
         span: Span,
     },
     While { cond: Expr, body: Vec<Stmt>, span: Span },
+    Break(Span),
+    Continue(Span),
     Return { value: Option<Expr>, span: Span },
     Expr(Expr),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Neg,
+    Not,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,9 +102,15 @@ pub enum Expr {
     Int(i64, Span),
     Float(f64, Span),
     Str(String, Span),
+    Char(char, Span),
     Bool(bool, Span),
     None(Span),
     Ident(String, Span),
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+        span: Span,
+    },
     Binary {
         op: BinOp,
         left: Box<Expr>,
@@ -186,19 +200,45 @@ impl<'a> Parser<'a> {
         match self.peek().kind.clone() {
             TokenKind::Use => self.parse_use(),
             TokenKind::Fn => self.parse_fn(),
+            TokenKind::Struct => self.parse_struct(),
             TokenKind::Let => self.parse_var(Mutability::Let),
             TokenKind::Mut => self.parse_var(Mutability::Mut),
             TokenKind::Const => self.parse_var(Mutability::Const),
             TokenKind::If => self.parse_if(),
             TokenKind::While => self.parse_while(),
+            TokenKind::Break => {
+                let span = self.advance().span;
+                Some(Stmt::Break(span))
+            }
+            TokenKind::Continue => {
+                let span = self.advance().span;
+                Some(Stmt::Continue(span))
+            }
             TokenKind::Return => self.parse_return(),
             TokenKind::Eof => None,
             _ => {
                 let expr = self.parse_expr(0)?;
-                if matches!(self.peek().kind, TokenKind::Eq) {
+                let compound_op = match self.peek().kind {
+                    TokenKind::Eq => Some(None),
+                    TokenKind::PlusEq => Some(Some(BinOp::Add)),
+                    TokenKind::MinusEq => Some(Some(BinOp::Sub)),
+                    TokenKind::StarEq => Some(Some(BinOp::Mul)),
+                    TokenKind::SlashEq => Some(Some(BinOp::Div)),
+                    _ => None,
+                };
+                if let Some(op_opt) = compound_op {
                     let eq_span = self.advance().span;
-                    if let Expr::Ident(name, _) = expr {
-                        let value = self.parse_expr(0)?;
+                    if let Expr::Ident(name, id_span) = expr {
+                        let rhs = self.parse_expr(0)?;
+                        let value = match op_opt {
+                            None => rhs,
+                            Some(op) => Expr::Binary {
+                                op,
+                                left: Box::new(Expr::Ident(name.clone(), id_span)),
+                                right: Box::new(rhs),
+                                span: eq_span,
+                            },
+                        };
                         return Some(Stmt::Assign {
                             name,
                             value,
@@ -227,10 +267,68 @@ impl<'a> Parser<'a> {
                 if let TokenKind::Ident(next) = self.peek().kind.clone() {
                     self.advance();
                     path.push(next);
+                } else {
+                    let tok = self.peek().clone();
+                    self.errors.push(ParseError {
+                        message: format!("Expected module identifier after '.', found {:?}", tok.kind),
+                        span: tok.span,
+                    });
+                    break;
                 }
             }
+        } else {
+            let tok = self.peek().clone();
+            self.errors.push(ParseError {
+                message: format!("Expected module path after 'use', found {:?}", tok.kind),
+                span: tok.span,
+            });
         }
         Some(Stmt::Use { path, span })
+    }
+
+    fn parse_struct(&mut self) -> Option<Stmt> {
+        let span = self.advance().span;
+        let name = match self.peek().kind.clone() {
+            TokenKind::Ident(n) => {
+                self.advance();
+                n
+            }
+            _ => {
+                let tok = self.peek().clone();
+                self.errors.push(ParseError {
+                    message: format!("Expected struct name, found {:?}", tok.kind),
+                    span: tok.span,
+                });
+                return None;
+            }
+        };
+        self.skip_newlines();
+        if self.expect(TokenKind::LBrace, "'{'").is_none() {
+            return None;
+        }
+        let mut fields = Vec::new();
+        self.skip_newlines();
+        while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+            if let TokenKind::Ident(field_name) = self.peek().kind.clone() {
+                self.advance();
+                self.expect(TokenKind::Colon, "':'");
+                let ty = self.parse_type();
+                fields.push((field_name, ty));
+                if matches!(self.peek().kind, TokenKind::Comma) {
+                    self.advance();
+                }
+            } else {
+                let tok = self.peek().clone();
+                self.errors.push(ParseError {
+                    message: format!("Expected field name in struct '{name}', found {:?}", tok.kind),
+                    span: tok.span,
+                });
+                self.advance();
+            }
+            self.skip_newlines();
+        }
+        self.expect(TokenKind::RBrace, "'}'");
+        Some(Stmt::Struct { name, fields, span })
     }
 
     fn parse_type(&mut self) -> TypeAnn {
@@ -240,9 +338,16 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let mut args = Vec::new();
                 while !matches!(self.peek().kind, TokenKind::Gt | TokenKind::Eof) {
+                    let before = self.pos;
                     args.push(self.parse_type());
                     if matches!(self.peek().kind, TokenKind::Comma) {
                         self.advance();
+                    } else if self.pos == before {
+                        // Guard against infinite loop on malformed generic arguments
+                        self.advance();
+                        break;
+                    } else if !matches!(self.peek().kind, TokenKind::Gt) {
+                        break;
                     }
                 }
                 self.expect(TokenKind::Gt, "'>'");
@@ -250,6 +355,11 @@ impl<'a> Parser<'a> {
             }
             TypeAnn::Simple(name)
         } else {
+            let tok = self.peek().clone();
+            self.errors.push(ParseError {
+                message: format!("Expected type name, found {:?}", tok.kind),
+                span: tok.span,
+            });
             TypeAnn::Simple("Any".to_string())
         }
     }
@@ -296,6 +406,14 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::Colon, "':'");
                 let ty = self.parse_type();
                 params.push((p_name, ty));
+            } else {
+                let tok = self.peek().clone();
+                self.errors.push(ParseError {
+                    message: format!("Expected parameter name, found {:?}", tok.kind),
+                    span: tok.span,
+                });
+                self.advance();
+                break;
             }
             if matches!(self.peek().kind, TokenKind::Comma) {
                 self.advance();
@@ -358,7 +476,12 @@ impl<'a> Parser<'a> {
         let then_body = self.parse_block();
         let else_body = if matches!(self.peek().kind, TokenKind::Else) {
             self.advance();
-            Some(self.parse_block())
+            if matches!(self.peek().kind, TokenKind::If) {
+                let nested = self.parse_if()?;
+                Some(vec![nested])
+            } else {
+                Some(self.parse_block())
+            }
         } else {
             None
         };
@@ -442,6 +565,10 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Some(Expr::Str(s, tok.span))
             }
+            TokenKind::Char(c) => {
+                self.advance();
+                Some(Expr::Char(c, tok.span))
+            }
             TokenKind::True => {
                 self.advance();
                 Some(Expr::Bool(true, tok.span))
@@ -453,6 +580,24 @@ impl<'a> Parser<'a> {
             TokenKind::None => {
                 self.advance();
                 Some(Expr::None(tok.span))
+            }
+            TokenKind::Minus => {
+                self.advance();
+                let inner = self.parse_expr(70)?;
+                Some(Expr::Unary {
+                    op: UnaryOp::Neg,
+                    expr: Box::new(inner),
+                    span: tok.span,
+                })
+            }
+            TokenKind::Bang => {
+                self.advance();
+                let inner = self.parse_expr(70)?;
+                Some(Expr::Unary {
+                    op: UnaryOp::Not,
+                    expr: Box::new(inner),
+                    span: tok.span,
+                })
             }
             TokenKind::Ident(name) => {
                 self.advance();
@@ -523,5 +668,47 @@ mod tests {
         let tokens = tokenize(src).expect("lex failed");
         let prog = Parser::new(&tokens).parse_program().expect("parse failed");
         assert_eq!(prog.items.len(), 1);
+    }
+
+    #[test]
+    fn parses_unary_else_if_struct_break_continue_and_compound_assign() {
+        let src = r#"
+struct Point {
+    x: Float,
+    y: Float
+}
+
+fn main() {
+    mut n = -5
+    n += 10
+    if !false && n > 0 {
+        while n > 0 {
+            n -= 1
+            if n == 2 {
+                continue
+            }
+            if n == 1 {
+                break
+            }
+        }
+    } else if n == 0 {
+        print("zero")
+    } else {
+        print("neg")
+    }
+}
+"#;
+        let tokens = tokenize(src).expect("lex failed");
+        let prog = Parser::new(&tokens).parse_program().expect("parse failed");
+        assert_eq!(prog.items.len(), 2);
+        assert!(matches!(prog.items[0], Stmt::Struct { ref name, .. } if name == "Point"));
+    }
+
+    #[test]
+    fn terminates_cleanly_on_malformed_generic_type() {
+        let src = "fn bad(x: Array<123>) {}";
+        let tokens = tokenize(src).expect("lex failed");
+        let res = Parser::new(&tokens).parse_program();
+        assert!(res.is_err());
     }
 }

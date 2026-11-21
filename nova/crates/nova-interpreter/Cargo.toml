@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 nova-parser = { path = "../nova-parser" }
 nova-runtime = { path = "../nova-runtime" }
+
+[dev-dependencies]
+nova-lexer = { path = "../nova-lexer" }

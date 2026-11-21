@@ -5,11 +5,18 @@ import path from 'node:path';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { compileAndRun, DEFAULT_OPT_OPTIONS, formatNovaSource } from './src/nova/index';
-import { buildNativeExecutable, executeNativeBinary } from './src/nova/native-builder';
+import {
+  buildNativeExecutable,
+  executeNativeBinary,
+  sanitizeModuleName,
+} from './src/nova/native-builder';
 
 const PORT = 3000;
 const ROOT_DIR = process.cwd();
 const NOVA_DIR = path.resolve(ROOT_DIR, 'nova');
+const MAX_SOURCE_CHARS = 64 * 1024;
+const MAX_CONCURRENT_NATIVE_BUILDS = 2;
+let activeNativeBuilds = 0;
 
 interface WorkspaceFileEntry {
   path: string;
@@ -32,7 +39,7 @@ function listNovaFiles(dir: string, base: string, acc: WorkspaceFileEntry[]): vo
       const text = fs.readFileSync(full, 'utf8');
       const lines = text.split('\n').length;
       let category: WorkspaceFileEntry['category'] = 'manifest';
-      if (rel.startsWith('crates/')) category = 'crate';
+      if (rel.startsWith('crates/') || rel.startsWith('runtime/')) category = 'crate';
       else if (rel.startsWith('examples/')) category = 'example';
       else if (rel.startsWith('docs/')) category = 'docs';
       acc.push({ path: rel, sizeBytes: stat.size, lines, category });
@@ -53,6 +60,10 @@ async function startServer(): Promise<void> {
   const app = express();
   app.use(express.json({ limit: '512kb' }));
 
+  app.get('/api/health', (_req, res) => {
+    res.json({ status: 'ok', novaVersion: '0.1.0' });
+  });
+
   app.get('/api/toolchain', (_req, res) => {
     res.json({
       novaVersion: '0.1.0',
@@ -66,7 +77,16 @@ async function startServer(): Promise<void> {
 
   app.post('/api/compile', (req, res) => {
     const source = typeof req.body?.source === 'string' ? req.body.source : '';
-    const filename = typeof req.body?.filename === 'string' ? req.body.filename : 'main.nova';
+    if (source.length > MAX_SOURCE_CHARS) {
+      res.status(413).json({
+        ok: false,
+        error: `Source exceeds maximum allowed length (${MAX_SOURCE_CHARS} characters).`,
+      });
+      return;
+    }
+    const filename = sanitizeModuleName(
+      typeof req.body?.filename === 'string' ? req.body.filename : 'main.nova'
+    );
     const execute = req.body?.execute !== false;
     const engine = req.body?.engine === 'interpreter' ? 'interpreter' : 'vm';
     const optimizations = {
@@ -107,12 +127,37 @@ async function startServer(): Promise<void> {
 
   app.post('/api/format', (req, res) => {
     const source = typeof req.body?.source === 'string' ? req.body.source : '';
+    if (source.length > MAX_SOURCE_CHARS) {
+      res.status(413).json({
+        ok: false,
+        error: `Source exceeds maximum allowed length (${MAX_SOURCE_CHARS} characters).`,
+      });
+      return;
+    }
     res.json(formatNovaSource(source));
   });
 
   app.post('/api/native-verify', (req, res) => {
     const source = typeof req.body?.source === 'string' ? req.body.source : '';
-    const filename = typeof req.body?.filename === 'string' ? req.body.filename : 'main.nova';
+    if (source.length > MAX_SOURCE_CHARS) {
+      res.status(413).json({
+        ok: false,
+        supported: false,
+        reason: `Source exceeds maximum allowed length (${MAX_SOURCE_CHARS} characters).`,
+      });
+      return;
+    }
+    if (activeNativeBuilds >= MAX_CONCURRENT_NATIVE_BUILDS) {
+      res.status(429).json({
+        ok: false,
+        supported: true,
+        reason: 'Native build runner is busy. Please retry shortly.',
+      });
+      return;
+    }
+    const filename = sanitizeModuleName(
+      typeof req.body?.filename === 'string' ? req.body.filename : 'main.nova'
+    );
     const profile = req.body?.profile === 'debug' ? 'debug' : 'release';
     const optimizations = {
       constantFolding: req.body?.optimizations?.constantFolding ?? true,
@@ -133,6 +178,7 @@ async function startServer(): Promise<void> {
       return;
     }
 
+    activeNativeBuilds += 1;
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nova-native-verify-'));
     const outBin = path.join(tmpDir, 'nova_bin');
     try {
@@ -205,6 +251,7 @@ async function startServer(): Promise<void> {
         reason: err instanceof Error ? err.message : String(err),
       });
     } finally {
+      activeNativeBuilds = Math.max(0, activeNativeBuilds - 1);
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });

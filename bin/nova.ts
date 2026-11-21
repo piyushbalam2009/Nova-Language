@@ -130,6 +130,7 @@ function main(): void {
       path.join(projectRoot, 'src/nova/vm-equivalence.test.ts'),
       path.join(projectRoot, 'src/nova/native-llvm.test.ts'),
       path.join(projectRoot, 'src/nova/ai-engine.test.ts'),
+      path.join(projectRoot, 'src/nova/security.test.ts'),
     ].filter((f) => fs.existsSync(f));
     execFileSync('npx', ['--yes', 'tsx', '--test', ...testFiles], {
       cwd: projectRoot,

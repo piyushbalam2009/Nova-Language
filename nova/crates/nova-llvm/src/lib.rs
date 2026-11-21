@@ -1,11 +1,18 @@
 //! Nova IR -> LLVM 17+ opaque-pointer IR (`.ll`) lowering, structural verifier,
-//! and native object compilation, linking, and release-strip build driver.
+//! embedded `libnovart` C99 runtime, and native object compilation, linking, and
+//! release-strip build driver.
 
 use nova_ir::{CmpOp, ConstVal, Inst, IrFunction, IrModule};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+pub const NOVA_RUNTIME_H: &str = include_str!("../../../runtime/novart.h");
+pub const NOVA_RUNTIME_C: &str = include_str!("../../../runtime/novart.c");
+
+static BUILD_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildProfile {
@@ -33,9 +40,18 @@ pub struct LlvmLowerResult {
 pub struct NativeBuildArtifact {
     pub output_path: PathBuf,
     pub profile: BuildProfile,
+    pub target_triple: String,
     pub stripped: bool,
     pub binary_bytes: u64,
     pub llvm_ir_path: Option<PathBuf>,
+}
+
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 pub fn host_target_triple() -> &'static str {
@@ -150,13 +166,14 @@ pub fn lower_to_llvm(module: &IrModule) -> LlvmLowerResult {
     lines.push("%struct.NVal = type { i32, i64, double, i1, ptr }".to_string());
     lines.push(String::new());
 
-    // Runtime C ABI declarations (libnovart)
+    // Canonical libnovart C99 ABI declarations (exact match with nova/runtime/novart.h)
     let decls = [
         "declare %struct.NVal @nv_none()",
         "declare %struct.NVal @nv_int(i64)",
         "declare %struct.NVal @nv_float(double)",
         "declare %struct.NVal @nv_bool(i1)",
-        "declare %struct.NVal @nv_str_copy(ptr)",
+        "declare %struct.NVal @nv_char(ptr)",
+        "declare %struct.NVal @nv_str(ptr)",
         "declare i1 @nv_truthy(%struct.NVal)",
         "declare %struct.NVal @nv_add(%struct.NVal, %struct.NVal)",
         "declare %struct.NVal @nv_sub(%struct.NVal, %struct.NVal)",
@@ -164,28 +181,32 @@ pub fn lower_to_llvm(module: &IrModule) -> LlvmLowerResult {
         "declare %struct.NVal @nv_div(%struct.NVal, %struct.NVal)",
         "declare %struct.NVal @nv_mod(%struct.NVal, %struct.NVal)",
         "declare %struct.NVal @nv_matmul(%struct.NVal, %struct.NVal)",
+        "declare %struct.NVal @nv_neg(%struct.NVal)",
         "declare %struct.NVal @nv_not(%struct.NVal)",
-        "declare %struct.NVal @nv_eq(%struct.NVal, %struct.NVal)",
-        "declare %struct.NVal @nv_neq(%struct.NVal, %struct.NVal)",
-        "declare %struct.NVal @nv_lt(%struct.NVal, %struct.NVal)",
-        "declare %struct.NVal @nv_lte(%struct.NVal, %struct.NVal)",
-        "declare %struct.NVal @nv_gt(%struct.NVal, %struct.NVal)",
-        "declare %struct.NVal @nv_gte(%struct.NVal, %struct.NVal)",
+        "declare %struct.NVal @nv_cmp_eq(%struct.NVal, %struct.NVal)",
+        "declare %struct.NVal @nv_cmp_neq(%struct.NVal, %struct.NVal)",
+        "declare %struct.NVal @nv_cmp_lt(%struct.NVal, %struct.NVal)",
+        "declare %struct.NVal @nv_cmp_lte(%struct.NVal, %struct.NVal)",
+        "declare %struct.NVal @nv_cmp_gt(%struct.NVal, %struct.NVal)",
+        "declare %struct.NVal @nv_cmp_gte(%struct.NVal, %struct.NVal)",
+        "declare %struct.NVal @nv_alloc_array(i32, ptr)",
         "declare %struct.NVal @nv_call_builtin(ptr, i32, ptr)",
-        "declare %struct.NVal @nv_builtin_print(ptr, i32)",
-        "declare %struct.NVal @nv_builtin_str(%struct.NVal)",
-        "declare %struct.NVal @nv_builtin_int(%struct.NVal)",
-        "declare %struct.NVal @nv_builtin_float(%struct.NVal)",
-        "declare %struct.NVal @nv_builtin_abs(%struct.NVal)",
-        "declare %struct.NVal @nv_builtin_sqrt(%struct.NVal)",
-        "declare %struct.NVal @nv_builtin_pow(%struct.NVal, %struct.NVal)",
-        "declare %struct.NVal @nv_builtin_min(%struct.NVal, %struct.NVal)",
-        "declare %struct.NVal @nv_builtin_max(%struct.NVal, %struct.NVal)",
     ];
     for d in decls {
         lines.push(d.to_string());
     }
     lines.push(String::new());
+
+    // Module-level globals
+    for g in &module.globals {
+        lines.push(format!(
+            "@nova_global_{} = internal global %struct.NVal zeroinitializer, align 8",
+            sanitize_ident(g)
+        ));
+    }
+    if !module.globals.is_empty() {
+        lines.push(String::new());
+    }
 
     pool.emit_globals(&mut lines);
     if !pool.entries.is_empty() {
@@ -200,6 +221,9 @@ pub fn lower_to_llvm(module: &IrModule) -> LlvmLowerResult {
     // C ABI main() entrypoint
     lines.push("define i32 @main() {".to_string());
     lines.push("entry:".to_string());
+    if user_fns.contains("__init__") {
+        lines.push("  %_init_ret = call %struct.NVal @nova_fn___init__()".to_string());
+    }
     if user_fns.contains("main") {
         lines.push("  %_entry_ret = call %struct.NVal @nova_fn_main()".to_string());
     }
@@ -225,7 +249,7 @@ fn lower_function(func: &IrFunction, user_fns: &HashSet<String>, pool: &mut Stri
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
-                Inst::Const { dst, .. } => {
+                Inst::Const { dst, .. } | Inst::LoadGlobal { dst, .. } => {
                     temps.insert(dst.clone());
                 }
                 Inst::Load { dst, slot } => {
@@ -236,11 +260,15 @@ fn lower_function(func: &IrFunction, user_fns: &HashSet<String>, pool: &mut Stri
                     locals.insert(slot.clone());
                     temps.insert(src.clone());
                 }
+                Inst::StoreGlobal { src, .. } => {
+                    temps.insert(src.clone());
+                }
                 Inst::Add { dst, left, right }
                 | Inst::Sub { dst, left, right }
                 | Inst::Mul { dst, left, right }
                 | Inst::Div { dst, left, right }
                 | Inst::Mod { dst, left, right }
+                | Inst::MatMul { dst, left, right }
                 | Inst::Compare {
                     dst, left, right, ..
                 } => {
@@ -248,9 +276,15 @@ fn lower_function(func: &IrFunction, user_fns: &HashSet<String>, pool: &mut Stri
                     temps.insert(left.clone());
                     temps.insert(right.clone());
                 }
-                Inst::Not { dst, src } => {
+                Inst::Neg { dst, src } | Inst::Not { dst, src } => {
                     temps.insert(dst.clone());
                     temps.insert(src.clone());
+                }
+                Inst::AllocArray { dst, elements } => {
+                    temps.insert(dst.clone());
+                    for e in elements {
+                        temps.insert(e.clone());
+                    }
                 }
                 Inst::Call { dst, args, .. } => {
                     temps.insert(dst.clone());
@@ -292,10 +326,16 @@ fn lower_function(func: &IrFunction, user_fns: &HashSet<String>, pool: &mut Stri
     };
 
     for l in &locals {
-        out.push(format!("  %var_{} = alloca %struct.NVal, align 8", sanitize_ident(l)));
+        out.push(format!(
+            "  %var_{} = alloca %struct.NVal, align 8",
+            sanitize_ident(l)
+        ));
     }
     for t in &temps {
-        out.push(format!("  %tmp_{} = alloca %struct.NVal, align 8", sanitize_ident(t)));
+        out.push(format!(
+            "  %tmp_{} = alloca %struct.NVal, align 8",
+            sanitize_ident(t)
+        ));
     }
 
     if !locals.is_empty() || !temps.is_empty() {
@@ -363,8 +403,17 @@ fn lower_function(func: &IrFunction, user_fns: &HashSet<String>, pool: &mut Stri
                         ConstVal::Bool(b) => {
                             out.push(format!(
                                 "  {r} = call %struct.NVal @nv_bool(i1 {})",
-                                if *b { 1 } else { 0 }
+                                i32::from(*b)
                             ));
+                        }
+                        ConstVal::Char(ch) => {
+                            let s = ch.to_string();
+                            let (sym, len) = pool.intern(&s);
+                            let gep = next_reg("chrptr");
+                            out.push(format!(
+                                "  {gep} = getelementptr inbounds [{len} x i8], ptr {sym}, i64 0, i64 0"
+                            ));
+                            out.push(format!("  {r} = call %struct.NVal @nv_char(ptr {gep})"));
                         }
                         ConstVal::Str(s) => {
                             let (sym, len) = pool.intern(s);
@@ -372,7 +421,7 @@ fn lower_function(func: &IrFunction, user_fns: &HashSet<String>, pool: &mut Stri
                             out.push(format!(
                                 "  {gep} = getelementptr inbounds [{len} x i8], ptr {sym}, i64 0, i64 0"
                             ));
-                            out.push(format!("  {r} = call %struct.NVal @nv_str_copy(ptr {gep})"));
+                            out.push(format!("  {r} = call %struct.NVal @nv_str(ptr {gep})"));
                         }
                         ConstVal::None => {
                             out.push(format!("  {r} = call %struct.NVal @nv_none()"));
@@ -405,17 +454,41 @@ fn lower_function(func: &IrFunction, user_fns: &HashSet<String>, pool: &mut Stri
                         sanitize_ident(slot)
                     ));
                 }
+                Inst::LoadGlobal { dst, name } => {
+                    let r = next_reg("ldg");
+                    out.push(format!(
+                        "  {r} = load %struct.NVal, ptr @nova_global_{}, align 8",
+                        sanitize_ident(name)
+                    ));
+                    out.push(format!(
+                        "  store %struct.NVal {r}, ptr %tmp_{}, align 8",
+                        sanitize_ident(dst)
+                    ));
+                }
+                Inst::StoreGlobal { name, src } => {
+                    let r = next_reg("stg");
+                    out.push(format!(
+                        "  {r} = load %struct.NVal, ptr %tmp_{}, align 8",
+                        sanitize_ident(src)
+                    ));
+                    out.push(format!(
+                        "  store %struct.NVal {r}, ptr @nova_global_{}, align 8",
+                        sanitize_ident(name)
+                    ));
+                }
                 Inst::Add { dst, left, right }
                 | Inst::Sub { dst, left, right }
                 | Inst::Mul { dst, left, right }
                 | Inst::Div { dst, left, right }
-                | Inst::Mod { dst, left, right } => {
+                | Inst::Mod { dst, left, right }
+                | Inst::MatMul { dst, left, right } => {
                     let helper = match inst {
                         Inst::Add { .. } => "@nv_add",
                         Inst::Sub { .. } => "@nv_sub",
                         Inst::Mul { .. } => "@nv_mul",
                         Inst::Div { .. } => "@nv_div",
                         Inst::Mod { .. } => "@nv_mod",
+                        Inst::MatMul { .. } => "@nv_matmul",
                         _ => unreachable!(),
                     };
                     let lv = next_reg("l");
@@ -437,15 +510,20 @@ fn lower_function(func: &IrFunction, user_fns: &HashSet<String>, pool: &mut Stri
                         sanitize_ident(dst)
                     ));
                 }
-                Inst::Not { dst, src } => {
+                Inst::Neg { dst, src } | Inst::Not { dst, src } => {
+                    let helper = if matches!(inst, Inst::Neg { .. }) {
+                        "@nv_neg"
+                    } else {
+                        "@nv_not"
+                    };
                     let v = next_reg("u");
-                    let res = next_reg("not");
+                    let res = next_reg("un");
                     out.push(format!(
                         "  {v} = load %struct.NVal, ptr %tmp_{}, align 8",
                         sanitize_ident(src)
                     ));
                     out.push(format!(
-                        "  {res} = call %struct.NVal @nv_not(%struct.NVal {v})"
+                        "  {res} = call %struct.NVal {helper}(%struct.NVal {v})"
                     ));
                     out.push(format!(
                         "  store %struct.NVal {res}, ptr %tmp_{}, align 8",
@@ -459,12 +537,12 @@ fn lower_function(func: &IrFunction, user_fns: &HashSet<String>, pool: &mut Stri
                     right,
                 } => {
                     let helper = match cmp {
-                        CmpOp::Eq => "@nv_eq",
-                        CmpOp::NotEq => "@nv_neq",
-                        CmpOp::Lt => "@nv_lt",
-                        CmpOp::LtEq => "@nv_lte",
-                        CmpOp::Gt => "@nv_gt",
-                        CmpOp::GtEq => "@nv_gte",
+                        CmpOp::Eq => "@nv_cmp_eq",
+                        CmpOp::NotEq => "@nv_cmp_neq",
+                        CmpOp::Lt => "@nv_cmp_lt",
+                        CmpOp::LtEq => "@nv_cmp_lte",
+                        CmpOp::Gt => "@nv_cmp_gt",
+                        CmpOp::GtEq => "@nv_cmp_gte",
                     };
                     let lv = next_reg("cl");
                     let rv = next_reg("cr");
@@ -485,6 +563,43 @@ fn lower_function(func: &IrFunction, user_fns: &HashSet<String>, pool: &mut Stri
                         sanitize_ident(dst)
                     ));
                 }
+                Inst::AllocArray { dst, elements } => {
+                    let count = elements.len();
+                    let res = next_reg("arr");
+                    if count == 0 {
+                        out.push(format!(
+                            "  {res} = call %struct.NVal @nv_alloc_array(i32 0, ptr null)"
+                        ));
+                    } else {
+                        let buf = next_reg("arrbuf");
+                        out.push(format!(
+                            "  {buf} = alloca [{count} x %struct.NVal], align 8"
+                        ));
+                        for (idx, el) in elements.iter().enumerate() {
+                            let ev = next_reg("el");
+                            let gep = next_reg("egep");
+                            out.push(format!(
+                                "  {ev} = load %struct.NVal, ptr %tmp_{}, align 8",
+                                sanitize_ident(el)
+                            ));
+                            out.push(format!(
+                                "  {gep} = getelementptr inbounds [{count} x %struct.NVal], ptr {buf}, i64 0, i64 {idx}"
+                            ));
+                            out.push(format!("  store %struct.NVal {ev}, ptr {gep}, align 8"));
+                        }
+                        let base = next_reg("abase");
+                        out.push(format!(
+                            "  {base} = getelementptr inbounds [{count} x %struct.NVal], ptr {buf}, i64 0, i64 0"
+                        ));
+                        out.push(format!(
+                            "  {res} = call %struct.NVal @nv_alloc_array(i32 {count}, ptr {base})"
+                        ));
+                    }
+                    out.push(format!(
+                        "  store %struct.NVal {res}, ptr %tmp_{}, align 8",
+                        sanitize_ident(dst)
+                    ));
+                }
                 Inst::Call { dst, callee, args } => {
                     let mut loaded_args = Vec::with_capacity(args.len());
                     for a in args {
@@ -496,28 +611,7 @@ fn lower_function(func: &IrFunction, user_fns: &HashSet<String>, pool: &mut Stri
                         loaded_args.push(av);
                     }
                     let res = next_reg("call");
-                    if callee == "print" {
-                        let argc = loaded_args.len();
-                        let arr = next_reg("pargs");
-                        let alloc_len = argc.max(1);
-                        out.push(format!(
-                            "  {arr} = alloca [{alloc_len} x %struct.NVal], align 8"
-                        ));
-                        for (idx, av) in loaded_args.iter().enumerate() {
-                            let gep = next_reg("pgep");
-                            out.push(format!(
-                                "  {gep} = getelementptr inbounds [{alloc_len} x %struct.NVal], ptr {arr}, i64 0, i64 {idx}"
-                            ));
-                            out.push(format!("  store %struct.NVal {av}, ptr {gep}, align 8"));
-                        }
-                        let base = next_reg("pbase");
-                        out.push(format!(
-                            "  {base} = getelementptr inbounds [{alloc_len} x %struct.NVal], ptr {arr}, i64 0, i64 0"
-                        ));
-                        out.push(format!(
-                            "  {res} = call %struct.NVal @nv_builtin_print(ptr {base}, i32 {argc})"
-                        ));
-                    } else if user_fns.contains(callee) {
+                    if user_fns.contains(callee) {
                         let sig = loaded_args
                             .iter()
                             .map(|a| format!("%struct.NVal {a}"))
@@ -528,53 +622,35 @@ fn lower_function(func: &IrFunction, user_fns: &HashSet<String>, pool: &mut Stri
                             sanitize_ident(callee)
                         ));
                     } else {
-                        let helper = match callee.as_str() {
-                            "str" => Some("@nv_builtin_str"),
-                            "int" => Some("@nv_builtin_int"),
-                            "float" => Some("@nv_builtin_float"),
-                            "abs" => Some("@nv_builtin_abs"),
-                            "sqrt" => Some("@nv_builtin_sqrt"),
-                            "pow" => Some("@nv_builtin_pow"),
-                            "min" => Some("@nv_builtin_min"),
-                            "max" => Some("@nv_builtin_max"),
-                            _ => None,
-                        };
-                        if let Some(h) = helper {
-                            let sig = loaded_args
-                                .iter()
-                                .map(|a| format!("%struct.NVal {a}"))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            out.push(format!("  {res} = call %struct.NVal {h}({sig})"));
-                        } else {
-                            let (sym, slen) = pool.intern(callee);
-                            let name_ptr = next_reg("bname");
+                        let (sym, slen) = pool.intern(callee);
+                        let name_ptr = next_reg("bname");
+                        out.push(format!(
+                            "  {name_ptr} = getelementptr inbounds [{slen} x i8], ptr {sym}, i64 0, i64 0"
+                        ));
+                        let argc = loaded_args.len();
+                        if argc == 0 {
                             out.push(format!(
-                                "  {name_ptr} = getelementptr inbounds [{slen} x i8], ptr {sym}, i64 0, i64 0"
+                                "  {res} = call %struct.NVal @nv_call_builtin(ptr {name_ptr}, i32 0, ptr null)"
                             ));
-                            let argc = loaded_args.len();
-                            if argc == 0 {
+                        } else {
+                            let arr = next_reg("bargs");
+                            out.push(format!(
+                                "  {arr} = alloca [{argc} x %struct.NVal], align 8"
+                            ));
+                            for (idx, av) in loaded_args.iter().enumerate() {
+                                let gep = next_reg("bgep");
                                 out.push(format!(
-                                    "  {res} = call %struct.NVal @nv_call_builtin(ptr {name_ptr}, i32 0, ptr null)"
+                                    "  {gep} = getelementptr inbounds [{argc} x %struct.NVal], ptr {arr}, i64 0, i64 {idx}"
                                 ));
-                            } else {
-                                let arr = next_reg("bargs");
-                                out.push(format!("  {arr} = alloca [{argc} x %struct.NVal], align 8"));
-                                for (idx, av) in loaded_args.iter().enumerate() {
-                                    let gep = next_reg("bgep");
-                                    out.push(format!(
-                                        "  {gep} = getelementptr inbounds [{argc} x %struct.NVal], ptr {arr}, i64 0, i64 {idx}"
-                                    ));
-                                    out.push(format!("  store %struct.NVal {av}, ptr {gep}, align 8"));
-                                }
-                                let base = next_reg("bbase");
-                                out.push(format!(
-                                    "  {base} = getelementptr inbounds [{argc} x %struct.NVal], ptr {arr}, i64 0, i64 0"
-                                ));
-                                out.push(format!(
-                                    "  {res} = call %struct.NVal @nv_call_builtin(ptr {name_ptr}, i32 {argc}, ptr {base})"
-                                ));
+                                out.push(format!("  store %struct.NVal {av}, ptr {gep}, align 8"));
                             }
+                            let base = next_reg("bbase");
+                            out.push(format!(
+                                "  {base} = getelementptr inbounds [{argc} x %struct.NVal], ptr {arr}, i64 0, i64 0"
+                            ));
+                            out.push(format!(
+                                "  {res} = call %struct.NVal @nv_call_builtin(ptr {name_ptr}, i32 {argc}, ptr {base})"
+                            ));
                         }
                     }
                     out.push(format!(
@@ -749,8 +825,49 @@ pub fn validate_llvm_ir(ir: &str) -> LlvmValidationReport {
     }
 }
 
-/// Compile emitted LLVM IR `.ll` + a `novart.c` runtime file to a native binary via `clang`
-/// (and run `strip --strip-all` for `BuildProfile::Release`).
+/// Compile emitted LLVM IR `.ll` + the embedded `libnovart` C99 runtime into a real,
+/// standalone native executable via `clang` (with `-O3`, `--gc-sections`, and `strip` in Release).
+pub fn build_native_executable(
+    module: &IrModule,
+    output_path: &Path,
+    profile: BuildProfile,
+    emit_llvm_path: Option<&Path>,
+) -> Result<NativeBuildArtifact, String> {
+    let lowered = lower_to_llvm(module);
+    if !lowered.validation.ok {
+        return Err(format!(
+            "LLVM IR validation failed: {}",
+            lowered.validation.errors.join("; ")
+        ));
+    }
+
+    let build_id = BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "nova-llvm-build-{}-{}",
+        std::process::id(),
+        build_id
+    ));
+    fs::create_dir_all(&tmp_dir).map_err(|e| format!("failed to create temp build dir: {e}"))?;
+    let _guard = TempDirGuard(tmp_dir.clone());
+
+    let header_file = tmp_dir.join("novart.h");
+    let rt_c_file = tmp_dir.join("novart.c");
+    fs::write(&header_file, NOVA_RUNTIME_H)
+        .map_err(|e| format!("failed to write novart.h: {e}"))?;
+    fs::write(&rt_c_file, NOVA_RUNTIME_C)
+        .map_err(|e| format!("failed to write novart.c: {e}"))?;
+
+    compile_and_link_with_clang(
+        &lowered,
+        &tmp_dir,
+        &rt_c_file,
+        output_path,
+        profile,
+        emit_llvm_path,
+    )
+}
+
+/// Compile emitted LLVM IR `.ll` + an explicit `novart.c` runtime file to a native binary via `clang`.
 pub fn build_native_with_clang(
     module: &IrModule,
     novart_c_path: &Path,
@@ -766,9 +883,37 @@ pub fn build_native_with_clang(
         ));
     }
 
-    let tmp_dir = std::env::temp_dir().join(format!("nova-llvm-build-{}", std::process::id()));
+    let build_id = BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "nova-llvm-build-{}-{}",
+        std::process::id(),
+        build_id
+    ));
     fs::create_dir_all(&tmp_dir).map_err(|e| format!("failed to create temp build dir: {e}"))?;
+    let _guard = TempDirGuard(tmp_dir.clone());
 
+    let header_file = tmp_dir.join("novart.h");
+    fs::write(&header_file, NOVA_RUNTIME_H)
+        .map_err(|e| format!("failed to write novart.h: {e}"))?;
+
+    compile_and_link_with_clang(
+        &lowered,
+        &tmp_dir,
+        novart_c_path,
+        output_path,
+        profile,
+        emit_llvm_path,
+    )
+}
+
+fn compile_and_link_with_clang(
+    lowered: &LlvmLowerResult,
+    tmp_dir: &Path,
+    novart_c_path: &Path,
+    output_path: &Path,
+    profile: BuildProfile,
+    emit_llvm_path: Option<&Path>,
+) -> Result<NativeBuildArtifact, String> {
     let ll_file = tmp_dir.join("program.ll");
     let prog_obj = tmp_dir.join("program.o");
     let rt_obj = tmp_dir.join("libnovart.o");
@@ -780,26 +925,23 @@ pub fn build_native_with_clang(
             .map_err(|e| format!("failed to emit LLVM IR to {}: {e}", emit_p.display()))?;
     }
 
-    let opt_flag = match profile {
-        BuildProfile::Debug => "-O0",
-        BuildProfile::Release => "-O3",
+    let opt_flags: &[&str] = match profile {
+        BuildProfile::Debug => &["-O0", "-g"],
+        BuildProfile::Release => &["-O3", "-DNDEBUG", "-ffunction-sections", "-fdata-sections"],
     };
 
     let mut prog_cmd = Command::new("clang");
     prog_cmd
         .arg("-c")
-        .arg(opt_flag)
+        .args(opt_flags)
+        .arg("-Wno-override-module")
         .arg(&ll_file)
         .arg("-o")
         .arg(&prog_obj);
-    if profile == BuildProfile::Debug {
-        prog_cmd.arg("-g");
-    }
     let status = prog_cmd
         .status()
-        .map_err(|e| format!("failed to invoke clang (is LLVM/clang installed on PATH?): {e}"))?;
+        .map_err(|e| format!("failed to invoke clang (LLVM/clang is required for native builds): {e}"))?;
     if !status.success() {
-        let _ = fs::remove_dir_all(&tmp_dir);
         return Err("clang failed while compiling LLVM IR to object file".to_string());
     }
 
@@ -807,7 +949,9 @@ pub fn build_native_with_clang(
     rt_cmd
         .arg("-c")
         .arg("-std=c99")
-        .arg(opt_flag)
+        .args(opt_flags)
+        .arg("-I")
+        .arg(tmp_dir)
         .arg(novart_c_path)
         .arg("-o")
         .arg(&rt_obj);
@@ -815,22 +959,18 @@ pub fn build_native_with_clang(
         .status()
         .map_err(|e| format!("failed to invoke clang for libnovart.o: {e}"))?;
     if !rt_status.success() {
-        let _ = fs::remove_dir_all(&tmp_dir);
         return Err("clang failed while compiling libnovart.o".to_string());
     }
 
     let mut link_cmd = Command::new("clang");
-    link_cmd
-        .arg(opt_flag)
-        .arg(&prog_obj)
-        .arg(&rt_obj)
-        .arg("-o")
-        .arg(output_path)
-        .arg("-lm");
+    link_cmd.arg(&prog_obj).arg(&rt_obj);
+    if profile == BuildProfile::Release {
+        link_cmd.arg("-Wl,--gc-sections");
+    }
+    link_cmd.arg("-lm").arg("-o").arg(output_path);
     let link_status = link_cmd
         .status()
         .map_err(|e| format!("failed to link native executable: {e}"))?;
-    let _ = fs::remove_dir_all(&tmp_dir);
     if !link_status.success() {
         return Err("native linker failed".to_string());
     }
@@ -850,9 +990,10 @@ pub fn build_native_with_clang(
     Ok(NativeBuildArtifact {
         output_path: output_path.to_path_buf(),
         profile,
+        target_triple: lowered.target_triple.clone(),
         stripped,
         binary_bytes,
-        llvm_ir_path: emit_llvm_path.map(|p| p.to_path_buf()),
+        llvm_ir_path: emit_llvm_path.map(Path::to_path_buf),
     })
 }
 
@@ -864,15 +1005,19 @@ mod tests {
     use nova_parser::Parser;
 
     #[test]
-    fn lowers_and_validates_hello_world_to_llvm_ir() {
+    fn lowers_and_validates_hello_world_to_libnovart_llvm_ir() {
         let src = r#"
+const GREETING = "Hello, "
+
 fn add(a: Int, b: Int) -> Int {
     return a + b
 }
 
 fn main() {
+    let name = "Nova"
+    print(GREETING + name)
     let x = add(10, 32)
-    print(x)
+    print(-x)
 }
 "#;
         let tokens = tokenize(src).unwrap();
@@ -881,10 +1026,31 @@ fn main() {
         fold_constants(&mut ir);
 
         let lowered = lower_to_llvm(&ir);
-        assert!(lowered.validation.ok, "errors: {:?}", lowered.validation.errors);
-        assert!(lowered.llvm_ir.contains("%struct.NVal = type { i32, i64, double, i1, ptr }"));
-        assert!(lowered.llvm_ir.contains("define internal %struct.NVal @nova_fn_add("));
+        assert!(
+            lowered.validation.ok,
+            "errors: {:?}",
+            lowered.validation.errors
+        );
+        assert!(lowered
+            .llvm_ir
+            .contains("%struct.NVal = type { i32, i64, double, i1, ptr }"));
+        assert!(lowered.llvm_ir.contains("declare %struct.NVal @nv_str(ptr)"));
+        assert!(lowered
+            .llvm_ir
+            .contains("declare %struct.NVal @nv_cmp_eq(%struct.NVal, %struct.NVal)"));
+        assert!(lowered
+            .llvm_ir
+            .contains("define internal %struct.NVal @nova_fn___init__()"));
+        assert!(lowered
+            .llvm_ir
+            .contains("define internal %struct.NVal @nova_fn_add("));
         assert!(lowered.llvm_ir.contains("define i32 @main()"));
+    }
+
+    #[test]
+    fn embeds_libnovart_runtime_sources() {
+        assert!(NOVA_RUNTIME_H.contains("NVal nv_call_builtin"));
+        assert!(NOVA_RUNTIME_C.contains("nv_alloc_array"));
     }
 
     #[test]

@@ -148,13 +148,133 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, Vec<LexError>> {
         let start_col = col;
         let start_line = line;
 
+        // Block comments: /* ... */
+        if ch == '/' && peek(i + 1).map(|(_, c)| c) == Some('*') {
+            i += 2;
+            col += 2;
+            let mut closed = false;
+            while let Some((_, c)) = peek(i) {
+                if c == '*' && peek(i + 1).map(|(_, n)| n) == Some('/') {
+                    i += 2;
+                    col += 2;
+                    closed = true;
+                    break;
+                }
+                if c == '\n' {
+                    line += 1;
+                    col = 1;
+                } else {
+                    col += 1;
+                }
+                i += 1;
+            }
+            if !closed {
+                errors.push(LexError {
+                    message: "Unterminated block comment".to_string(),
+                    span: Span {
+                        start: byte_idx,
+                        end: source.len(),
+                        line: start_line,
+                        column: start_col,
+                    },
+                });
+            }
+            continue;
+        }
+
+        // Char literal
+        if ch == '\'' {
+            i += 1;
+            col += 1;
+            let char_val = match peek(i) {
+                Some((_, '\\')) => {
+                    let esc_start = peek(i).map(|(b, _)| b).unwrap_or(byte_idx);
+                    let esc_col = col;
+                    i += 1;
+                    col += 1;
+                    match peek(i) {
+                        Some((eb, esc)) => {
+                            i += 1;
+                            col += 1;
+                            match esc {
+                                'n' => Some('\n'),
+                                't' => Some('\t'),
+                                'r' => Some('\r'),
+                                '0' => Some('\0'),
+                                '\'' => Some('\''),
+                                '"' => Some('"'),
+                                '\\' => Some('\\'),
+                                other => {
+                                    errors.push(LexError {
+                                        message: format!("Unknown escape sequence '\\{other}'"),
+                                        span: Span {
+                                            start: esc_start,
+                                            end: eb + other.len_utf8(),
+                                            line: start_line,
+                                            column: esc_col,
+                                        },
+                                    });
+                                    None
+                                }
+                            }
+                        }
+                        None => None,
+                    }
+                }
+                Some((_, '\'')) | Some((_, '\n')) | None => None,
+                Some((_, c)) => {
+                    i += 1;
+                    col += 1;
+                    Some(c)
+                }
+            };
+            let closed = if peek(i).map(|(_, c)| c) == Some('\'') {
+                i += 1;
+                col += 1;
+                true
+            } else {
+                // Recover to closing quote or newline
+                while let Some((_, c)) = peek(i) {
+                    if c == '\'' {
+                        i += 1;
+                        col += 1;
+                        break;
+                    }
+                    if c == '\n' {
+                        break;
+                    }
+                    i += 1;
+                    col += 1;
+                }
+                false
+            };
+            let end_byte = peek(i).map(|(b, _)| b).unwrap_or(source.len());
+            let span = Span {
+                start: byte_idx,
+                end: end_byte,
+                line: start_line,
+                column: start_col,
+            };
+            match (char_val, closed) {
+                (Some(c), true) => tokens.push(Token {
+                    kind: TokenKind::Char(c),
+                    span,
+                }),
+                _ => errors.push(LexError {
+                    message: "Invalid or unterminated character literal".to_string(),
+                    span,
+                }),
+            }
+            continue;
+        }
+
         // String literal
         if ch == '"' {
             i += 1;
             col += 1;
             let mut value = String::new();
             let mut closed = false;
-            while let Some((_, c)) = peek(i) {
+            while let Some((cur_byte, c)) = peek(i) {
                 if c == '"' {
                     i += 1;
                     col += 1;
@@ -165,24 +285,27 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, Vec<LexError>> {
                     break;
                 }
                 if c == '\\' {
+                    let esc_col = col;
                     i += 1;
                     col += 1;
-                    if let Some((_, esc)) = peek(i) {
+                    if let Some((esc_byte, esc)) = peek(i) {
                         i += 1;
                         col += 1;
                         match esc {
                             'n' => value.push('\n'),
                             't' => value.push('\t'),
                             'r' => value.push('\r'),
+                            '0' => value.push('\0'),
+                            '\'' => value.push('\''),
                             '"' => value.push('"'),
                             '\\' => value.push('\\'),
                             other => errors.push(LexError {
                                 message: format!("Unknown escape sequence '\\{other}'"),
                                 span: Span {
-                                    start: byte_idx,
-                                    end: byte_idx + 2,
+                                    start: cur_byte,
+                                    end: esc_byte + other.len_utf8(),
                                     line: start_line,
-                                    column: col,
+                                    column: esc_col,
                                 },
                             }),
                         }
@@ -214,8 +337,48 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, Vec<LexError>> {
             continue;
         }
 
-        // Numbers
+        // Numbers (decimal, hex 0x, binary 0b, float, scientific notation)
         if ch.is_ascii_digit() {
+            if ch == '0' && matches!(peek(i + 1).map(|(_, c)| c), Some('x' | 'X' | 'b' | 'B')) {
+                let prefix = peek(i + 1).map(|(_, c)| c).unwrap_or('x');
+                let radix = if prefix == 'x' || prefix == 'X' { 16 } else { 2 };
+                i += 2;
+                col += 2;
+                let mut digits = String::new();
+                while let Some((_, c)) = peek(i) {
+                    if c == '_' {
+                        i += 1;
+                        col += 1;
+                    } else if (radix == 16 && c.is_ascii_hexdigit())
+                        || (radix == 2 && (c == '0' || c == '1'))
+                    {
+                        digits.push(c);
+                        i += 1;
+                        col += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let end_byte = peek(i).map(|(b, _)| b).unwrap_or(source.len());
+                let span = Span {
+                    start: byte_idx,
+                    end: end_byte,
+                    line: start_line,
+                    column: start_col,
+                };
+                match i64::from_str_radix(&digits, radix) {
+                    Ok(v) => tokens.push(Token {
+                        kind: TokenKind::Int(v),
+                        span,
+                    }),
+                    Err(_) => errors.push(LexError {
+                        message: format!("Invalid base-{radix} integer literal"),
+                        span,
+                    }),
+                }
+                continue;
+            }
+
             let mut text = String::new();
             let mut is_float = false;
             while let Some((_, c)) = peek(i) {
@@ -242,8 +405,42 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, Vec<LexError>> {
                         text.push(c);
                         i += 1;
                         col += 1;
+                    } else if c == '_' {
+                        i += 1;
+                        col += 1;
                     } else {
                         break;
+                    }
+                }
+            }
+            // Scientific notation exponent: e.g. 1e-5, 2.5E+3
+            if matches!(peek(i).map(|(_, c)| c), Some('e' | 'E')) {
+                let next1 = peek(i + 1).map(|(_, c)| c);
+                let next2 = peek(i + 2).map(|(_, c)| c);
+                let has_exp_digits = matches!(next1, Some(c) if c.is_ascii_digit())
+                    || (matches!(next1, Some('+' | '-'))
+                        && matches!(next2, Some(c) if c.is_ascii_digit()));
+                if has_exp_digits {
+                    is_float = true;
+                    text.push('e');
+                    i += 1;
+                    col += 1;
+                    if let Some((_, sign @ ('+' | '-'))) = peek(i) {
+                        text.push(sign);
+                        i += 1;
+                        col += 1;
+                    }
+                    while let Some((_, c)) = peek(i) {
+                        if c.is_ascii_digit() {
+                            text.push(c);
+                            i += 1;
+                            col += 1;
+                        } else if c == '_' {
+                            i += 1;
+                            col += 1;
+                        } else {
+                            break;
+                        }
                     }
                 }
             }
@@ -442,5 +639,27 @@ mod tests {
     fn reports_unterminated_string() {
         let res = tokenize("let s = \"unterminated");
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn tokenizes_char_block_comments_and_numeric_formats() {
+        let src = "/* multi\nline */ let c = 'x'\nlet h = 0xff\nlet b = 0b1010\nlet f = 1.5e-2";
+        let toks = tokenize(src).expect("should lex cleanly");
+        assert!(toks.iter().any(|t| t.kind == TokenKind::Char('x')));
+        assert!(toks.iter().any(|t| t.kind == TokenKind::Int(255)));
+        assert!(toks.iter().any(|t| t.kind == TokenKind::Int(10)));
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Float(v) if (v - 0.015).abs() < 1e-12)));
+    }
+
+    #[test]
+    fn reports_accurate_escape_span_and_unterminated_block_comment() {
+        let err = tokenize("let s = \"abc\\q\"").unwrap_err();
+        assert_eq!(err.len(), 1);
+        assert_eq!(err[0].span.start, 12);
+        assert_eq!(err[0].span.column, 13);
+
+        let block_err = tokenize("/* unterminated").unwrap_err();
+        assert_eq!(block_err.len(), 1);
+        assert!(block_err[0].message.contains("block comment"));
     }
 }

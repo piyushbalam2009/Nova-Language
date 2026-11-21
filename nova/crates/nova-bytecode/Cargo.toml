@@ -6,3 +6,7 @@ license.workspace = true
 
 [dependencies]
 nova-ir = { path = "../nova-ir" }
+
+[dev-dependencies]
+nova-lexer = { path = "../nova-lexer" }
+nova-parser = { path = "../nova-parser" }

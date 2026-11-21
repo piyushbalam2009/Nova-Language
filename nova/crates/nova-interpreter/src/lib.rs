@@ -1,8 +1,15 @@
 //! Nova 0.1 AST Tree-Walking Interpreter (independent of bytecode VM and LLVM).
 
-use nova_parser::{BinOp, Expr, Mutability, Program, Stmt};
-use nova_runtime::{dispatch_ai_builtin, Heap, Value};
+use nova_parser::{BinOp, Expr, Mutability, Program, Stmt, UnaryOp};
+use nova_runtime::{
+    dispatch_ai_builtin, dispatch_stdlib_builtin, eval_add, eval_div, eval_matmul, eval_mod,
+    eval_mul, eval_neg, eval_ordering, eval_sub, Heap, Value,
+};
+use std::cmp::Ordering;
 use std::collections::HashMap;
+
+const MAX_CALL_DEPTH: usize = 256;
+const MAX_STEPS: usize = 250_000;
 
 #[derive(Debug, Clone)]
 struct Slot {
@@ -13,6 +20,8 @@ struct Slot {
 #[derive(Debug)]
 enum Control {
     Next,
+    Break,
+    Continue,
     Return(Value),
 }
 
@@ -25,6 +34,8 @@ struct UserFn {
 pub struct Interpreter {
     scopes: Vec<HashMap<String, Slot>>,
     functions: HashMap<String, UserFn>,
+    call_depth: usize,
+    pub steps_executed: usize,
     pub heap: Heap,
     pub stdout: Vec<String>,
 }
@@ -40,12 +51,18 @@ impl Interpreter {
         Self {
             scopes: vec![HashMap::new()],
             functions: HashMap::new(),
+            call_depth: 0,
+            steps_executed: 0,
             heap: Heap::new(),
             stdout: Vec::new(),
         }
     }
 
     pub fn run(&mut self, program: &Program) -> Result<(), String> {
+        self.steps_executed = 0;
+        self.call_depth = 0;
+        self.stdout.clear();
+
         for item in &program.items {
             if let Stmt::Fn {
                 name, params, body, ..
@@ -72,6 +89,35 @@ impl Interpreter {
 
         if let Some(main_fn) = self.functions.get("main").cloned() {
             self.call_user(&main_fn, Vec::new())?;
+        }
+        let roots = self.collect_roots();
+        self.heap.collect(&roots);
+        Ok(())
+    }
+
+    fn collect_roots(&self) -> Vec<Value> {
+        let mut roots = Vec::new();
+        for scope in &self.scopes {
+            for slot in scope.values() {
+                roots.push(slot.value.clone());
+            }
+        }
+        roots
+    }
+
+    fn maybe_collect_gc(&mut self) {
+        if self.heap.should_collect() {
+            let roots = self.collect_roots();
+            self.heap.collect(&roots);
+        }
+    }
+
+    fn tick_step(&mut self) -> Result<(), String> {
+        self.steps_executed += 1;
+        if self.steps_executed > MAX_STEPS {
+            return Err(format!(
+                "Execution limit exceeded ({MAX_STEPS} interpreter steps)"
+            ));
         }
         Ok(())
     }
@@ -102,11 +148,15 @@ impl Interpreter {
         self.scopes.push(HashMap::new());
         let mut result = Control::Next;
         for s in stmts {
-            match self.exec_stmt(s)? {
-                Control::Next => {}
-                Control::Return(v) => {
-                    result = Control::Return(v);
+            match self.exec_stmt(s) {
+                Ok(Control::Next) => {}
+                Ok(other) => {
+                    result = other;
                     break;
+                }
+                Err(err) => {
+                    self.scopes.pop();
+                    return Err(err);
                 }
             }
         }
@@ -115,6 +165,7 @@ impl Interpreter {
     }
 
     fn exec_stmt(&mut self, stmt: &Stmt) -> Result<Control, String> {
+        self.tick_step()?;
         match stmt {
             Stmt::Use { .. } | Stmt::Struct { .. } | Stmt::Fn { .. } => Ok(Control::Next),
             Stmt::VarDecl {
@@ -133,11 +184,13 @@ impl Interpreter {
                         },
                     );
                 }
+                self.maybe_collect_gc();
                 Ok(Control::Next)
             }
             Stmt::Assign { name, value, .. } => {
                 let val = self.eval_expr(value)?;
                 self.assign(name, val)?;
+                self.maybe_collect_gc();
                 Ok(Control::Next)
             }
             Stmt::If {
@@ -147,7 +200,7 @@ impl Interpreter {
                 ..
             } => {
                 let c = self.eval_expr(cond)?;
-                if self.is_truthy(&c) {
+                if self.heap.is_truthy(&c) {
                     self.exec_block(then_body)
                 } else if let Some(eb) = else_body {
                     self.exec_block(eb)
@@ -157,15 +210,21 @@ impl Interpreter {
             }
             Stmt::While { cond, body, .. } => {
                 while {
+                    self.tick_step()?;
                     let c = self.eval_expr(cond)?;
-                    self.is_truthy(&c)
+                    self.heap.is_truthy(&c)
                 } {
-                    if let Control::Return(v) = self.exec_block(body)? {
-                        return Ok(Control::Return(v));
+                    match self.exec_block(body)? {
+                        Control::Next | Control::Continue => {}
+                        Control::Break => break,
+                        Control::Return(v) => return Ok(Control::Return(v)),
                     }
+                    self.maybe_collect_gc();
                 }
                 Ok(Control::Next)
             }
+            Stmt::Break(_) => Ok(Control::Break),
+            Stmt::Continue(_) => Ok(Control::Continue),
             Stmt::Return { value, .. } => {
                 let v = match value {
                     Some(e) => self.eval_expr(e)?,
@@ -175,6 +234,7 @@ impl Interpreter {
             }
             Stmt::Expr(e) => {
                 self.eval_expr(e)?;
+                self.maybe_collect_gc();
                 Ok(Control::Next)
             }
         }
@@ -185,34 +245,42 @@ impl Interpreter {
             Expr::Int(i, _) => Ok(Value::Int(*i)),
             Expr::Float(f, _) => Ok(Value::Float(*f)),
             Expr::Str(s, _) => Ok(self.heap.alloc_string(s.clone())),
+            Expr::Char(c, _) => Ok(Value::Char(*c)),
             Expr::Bool(b, _) => Ok(Value::Bool(*b)),
             Expr::None(_) => Ok(Value::None),
             Expr::Ident(name, _) => self
                 .lookup(name)
                 .ok_or_else(|| format!("Undefined variable '{name}'")),
+            Expr::Unary { op, expr, .. } => {
+                let v = self.eval_expr(expr)?;
+                match op {
+                    UnaryOp::Neg => eval_neg(&mut self.heap, &v),
+                    UnaryOp::Not => Ok(Value::Bool(!self.heap.is_truthy(&v))),
+                }
+            }
             Expr::Binary {
                 op, left, right, ..
             } => {
                 // Short-circuit && and ||
                 if matches!(op, BinOp::And) {
                     let l = self.eval_expr(left)?;
-                    if !self.is_truthy(&l) {
+                    if !self.heap.is_truthy(&l) {
                         return Ok(Value::Bool(false));
                     }
                     let r = self.eval_expr(right)?;
-                    return Ok(Value::Bool(self.is_truthy(&r)));
+                    return Ok(Value::Bool(self.heap.is_truthy(&r)));
                 }
                 if matches!(op, BinOp::Or) {
                     let l = self.eval_expr(left)?;
-                    if self.is_truthy(&l) {
+                    if self.heap.is_truthy(&l) {
                         return Ok(Value::Bool(true));
                     }
                     let r = self.eval_expr(right)?;
-                    return Ok(Value::Bool(self.is_truthy(&r)));
+                    return Ok(Value::Bool(self.heap.is_truthy(&r)));
                 }
                 let l = self.eval_expr(left)?;
                 let r = self.eval_expr(right)?;
-                self.apply_binop(*op, l, r)
+                self.apply_binop(*op, &l, &r)
             }
             Expr::Call { callee, args, .. } => {
                 let mut eval_args = Vec::with_capacity(args.len());
@@ -227,15 +295,11 @@ impl Interpreter {
                     self.stdout.push(line.join(" "));
                     return Ok(Value::None);
                 }
-                if callee == "str" {
-                    let s = eval_args
-                        .first()
-                        .map(|v| self.heap.format_value(v))
-                        .unwrap_or_default();
-                    return Ok(self.heap.alloc_string(s));
-                }
                 if let Some(f) = self.functions.get(callee).cloned() {
                     return self.call_user(&f, eval_args);
+                }
+                if let Some(std_val) = dispatch_stdlib_builtin(&mut self.heap, callee, &eval_args)? {
+                    return Ok(std_val);
                 }
                 if let Some(ai_val) = dispatch_ai_builtin(&mut self.heap, callee, &eval_args)? {
                     return Ok(ai_val);
@@ -253,6 +317,13 @@ impl Interpreter {
     }
 
     fn call_user(&mut self, func: &UserFn, args: Vec<Value>) -> Result<Value, String> {
+        if self.call_depth >= MAX_CALL_DEPTH {
+            return Err(format!(
+                "Stack overflow: maximum recursion depth ({MAX_CALL_DEPTH}) exceeded"
+            ));
+        }
+        self.call_depth += 1;
+
         let mut fn_scope = HashMap::new();
         for (idx, param) in func.params.iter().enumerate() {
             let val = args.get(idx).cloned().unwrap_or(Value::None);
@@ -265,84 +336,56 @@ impl Interpreter {
             );
         }
         self.scopes.push(fn_scope);
-        let mut ret = Value::None;
+
+        let mut ret = Ok(Value::None);
         for s in &func.body {
-            if let Control::Return(v) = self.exec_stmt(s)? {
-                ret = v;
-                break;
+            match self.exec_stmt(s) {
+                Ok(Control::Next) => {}
+                Ok(Control::Return(v)) => {
+                    ret = Ok(v);
+                    break;
+                }
+                Ok(Control::Break | Control::Continue) => {
+                    ret = Err("Invalid loop control outside of loop".to_string());
+                    break;
+                }
+                Err(err) => {
+                    ret = Err(err);
+                    break;
+                }
             }
         }
+
         self.scopes.pop();
-        Ok(ret)
+        self.call_depth -= 1;
+        ret
     }
 
-    fn is_truthy(&self, v: &Value) -> bool {
-        match v {
-            Value::Bool(b) => *b,
-            Value::Int(i) => *i != 0,
-            Value::None => false,
-            _ => true,
-        }
-    }
-
-    fn apply_binop(&mut self, op: BinOp, l: Value, r: Value) -> Result<Value, String> {
+    fn apply_binop(&mut self, op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
         match op {
-            BinOp::Add => match (&l, &r) {
-                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
-                (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
-                _ => {
-                    let s = format!(
-                        "{}{}",
-                        self.heap.format_value(&l),
-                        self.heap.format_value(&r)
-                    );
-                    Ok(self.heap.alloc_string(s))
-                }
-            },
-            BinOp::Sub => match (l, r) {
-                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
-                (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
-                _ => Err("Invalid operands for '-'".to_string()),
-            },
-            BinOp::Mul => match (l, r) {
-                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
-                (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
-                _ => Err("Invalid operands for '*'".to_string()),
-            },
-            BinOp::Div => match (l, r) {
-                (Value::Int(_), Value::Int(0)) => Err("Division by zero".to_string()),
-                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a / b)),
-                (Value::Float(a), Value::Float(b)) if b != 0.0 => Ok(Value::Float(a / b)),
-                _ => Err("Division by zero or invalid operands".to_string()),
-            },
-            BinOp::Mod => match (l, r) {
-                (Value::Int(_), Value::Int(0)) => Err("Modulo by zero".to_string()),
-                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a % b)),
-                _ => Err("Invalid operands for '%'".to_string()),
-            },
-            BinOp::Eq => Ok(Value::Bool(l == r)),
-            BinOp::NotEq => Ok(Value::Bool(l != r)),
-            BinOp::Lt => match (l, r) {
-                (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a < b)),
-                (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a < b)),
-                _ => Err("Invalid operands for '<'".to_string()),
-            },
-            BinOp::LtEq => match (l, r) {
-                (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a <= b)),
-                (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a <= b)),
-                _ => Err("Invalid operands for '<='".to_string()),
-            },
-            BinOp::Gt => match (l, r) {
-                (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a > b)),
-                (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a > b)),
-                _ => Err("Invalid operands for '>'".to_string()),
-            },
-            BinOp::GtEq => match (l, r) {
-                (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a >= b)),
-                (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a >= b)),
-                _ => Err("Invalid operands for '>='".to_string()),
-            },
-            _ => Err(format!("Unsupported binary operator {op:?}")),
+            BinOp::Add => eval_add(&mut self.heap, l, r),
+            BinOp::Sub => eval_sub(&mut self.heap, l, r),
+            BinOp::Mul => eval_mul(&mut self.heap, l, r),
+            BinOp::Div => eval_div(&mut self.heap, l, r),
+            BinOp::Mod => eval_mod(l, r),
+            BinOp::MatMul => eval_matmul(&mut self.heap, l, r),
+            BinOp::Eq => Ok(Value::Bool(self.heap.values_equal(l, r))),
+            BinOp::NotEq => Ok(Value::Bool(!self.heap.values_equal(l, r))),
+            BinOp::Lt => Ok(Value::Bool(
+                eval_ordering(&self.heap, l, r)? == Ordering::Less,
+            )),
+            BinOp::LtEq => Ok(Value::Bool(matches!(
+                eval_ordering(&self.heap, l, r)?,
+                Ordering::Less | Ordering::Equal
+            ))),
+            BinOp::Gt => Ok(Value::Bool(
+                eval_ordering(&self.heap, l, r)? == Ordering::Greater,
+            )),
+            BinOp::GtEq => Ok(Value::Bool(matches!(
+                eval_ordering(&self.heap, l, r)?,
+                Ordering::Greater | Ordering::Equal
+            ))),
+            BinOp::And | BinOp::Or => unreachable!("short-circuit handled in eval_expr"),
         }
     }
 }
@@ -364,12 +407,55 @@ mod tests {
     }
 
     #[test]
-    fn respects_lexical_shadowing_and_short_circuit() {
-        let src = "fn main() {\n    let x = 1\n    if true {\n        let x = 2\n        print(x)\n    }\n    print(x)\n    if false && (1 / 0 == 0) {\n        print(\"bad\")\n    }\n}";
+    fn respects_lexical_shadowing_string_equality_and_short_circuit() {
+        let src = r#"
+fn main() {
+    let x = 1
+    if true {
+        let x = 2
+        print(x)
+    }
+    print(x)
+    let a = "No" + "va"
+    print(a == "Nova")
+    print(1 + 2.5)
+    if false && (1 / 0 == 0) {
+        print("bad")
+    }
+}
+"#;
         let toks = tokenize(src).unwrap();
         let prog = Parser::new(&toks).parse_program().unwrap();
         let mut interp = Interpreter::new();
         interp.run(&prog).unwrap();
-        assert_eq!(interp.stdout, vec!["2".to_string(), "1".to_string()]);
+        assert_eq!(
+            interp.stdout,
+            vec!["2", "1", "true", "3.5"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn collects_garbage_during_long_loop() {
+        let src = r#"
+fn main() {
+    mut i = 0
+    mut last = ""
+    while i < 400 {
+        last = "item-" + str(i)
+        i += 1
+    }
+    print(last)
+}
+"#;
+        let toks = tokenize(src).unwrap();
+        let prog = Parser::new(&toks).parse_program().unwrap();
+        let mut interp = Interpreter::new();
+        interp.run(&prog).unwrap();
+        assert_eq!(interp.stdout, vec!["item-399".to_string()]);
+        assert!(interp.heap.collections_run >= 1);
+        assert!(interp.heap.total_freed > 200);
     }
 }
